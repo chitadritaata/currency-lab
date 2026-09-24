@@ -1,0 +1,13 @@
+server:
+  port: 8090
+
+bot:
+  token: ${BOT_TOKEN}
+  username: ${BOT_USERNAME}
+
+tracker:
+  url: ${TRACKER_URL:http://currency-tracker:8081}
+
+logging:
+  level:
+    org.telegram: INFO

@@ -1,0 +1,33 @@
+# Secrets
+.env
+*.env
+!.env.example
+
+# Java / Maven
+target/
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+
+# Local data
+data/
+postgres-data/
