@@ -8,6 +8,15 @@ bot:
 tracker:
   url: ${TRACKER_URL:http://currency-tracker:8081}
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    tags:
+      application: telegram-bot
+
 logging:
   level:
     org.telegram: INFO

@@ -1,11 +1,14 @@
 package com.example.bot;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestTemplate;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
@@ -20,6 +23,7 @@ import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class MyBot extends TelegramLongPollingBot {
@@ -27,13 +31,16 @@ public class MyBot extends TelegramLongPollingBot {
     private final String botUsername;
     private final String trackerUrl;
     private final RestTemplate restTemplate = new RestTemplate();
+    private final MeterRegistry meterRegistry;
 
     public MyBot(@Value("${bot.token}") String botToken,
                  @Value("${bot.username}") String botUsername,
-                 @Value("${tracker.url}") String trackerUrl) {
+                 @Value("${tracker.url}") String trackerUrl,
+                 MeterRegistry meterRegistry) {
         super(botToken);
         this.botUsername = botUsername;
         this.trackerUrl = trackerUrl;
+        this.meterRegistry = meterRegistry;
     }
 
     @Override
@@ -41,22 +48,61 @@ public class MyBot extends TelegramLongPollingBot {
         return botUsername;
     }
 
+    // ============================================================
+    // ВХОДЯЩИЕ СОБЫТИЯ ОТ TELEGRAM
+    // ============================================================
+
     @Override
     public void onUpdateReceived(Update update) {
+
+        // ---- Нажатие inline-кнопки ----
         if (update.hasCallbackQuery()) {
-            handleCallback(update.getCallbackQuery());
+            Timer.Sample sample = Timer.start(meterRegistry);
+            CallbackQuery cb = update.getCallbackQuery();
+            String username = cb.getFrom() != null && cb.getFrom().getUserName() != null
+                    ? cb.getFrom().getUserName() : "unknown";
+
+            meterRegistry.counter("bot_callbacks_incoming_total",
+                    "user", username,
+                    "action", cb.getData()
+            ).increment();
+
+            handleCallback(cb);
+
+            String action = cb.getData().startsWith("cur:") ? cb.getData().substring(4) : "menu";
+            sample.stop(meterRegistry.timer("bot_user_response_duration_seconds",
+                    "action", action));
             return;
         }
+
+        // ---- Текстовое сообщение ----
         if (update.hasMessage() && update.getMessage().hasText()) {
+            Timer.Sample sample = Timer.start(meterRegistry);
             String text = update.getMessage().getText();
             Long chatId = update.getMessage().getChatId();
+            String username = update.getMessage().getFrom() != null
+                    && update.getMessage().getFrom().getUserName() != null
+                    ? update.getMessage().getFrom().getUserName() : "unknown";
+
+            meterRegistry.counter("bot_messages_incoming_total",
+                    "user", username,
+                    "command", text.startsWith("/") ? text : "text"
+            ).increment();
+
             if (text.equals("/start") || text.equals("/menu")) {
                 sendMainMenu(chatId);
             } else {
                 sendMessage(chatId, "Жми /start");
             }
+
+            sample.stop(meterRegistry.timer("bot_user_response_duration_seconds",
+                    "action", "message"));
         }
     }
+
+    // ============================================================
+    // МЕНЮ
+    // ============================================================
 
     private void sendMainMenu(Long chatId) {
         SendMessage msg = new SendMessage();
@@ -96,14 +142,17 @@ public class MyBot extends TelegramLongPollingBot {
         return markup;
     }
 
+    // ============================================================
+    // ОБРАБОТКА НАЖАТИЙ
+    // ============================================================
+
     private void handleCallback(CallbackQuery cb) {
         String data = cb.getData();
         Long chatId = cb.getMessage().getChatId();
         Integer msgId = cb.getMessage().getMessageId();
 
         String username = cb.getFrom() != null && cb.getFrom().getUserName() != null
-                ? cb.getFrom().getUserName()
-                : "unknown";
+                ? cb.getFrom().getUserName() : "unknown";
 
         answerCallback(cb.getId());
 
@@ -127,6 +176,10 @@ public class MyBot extends TelegramLongPollingBot {
     }
 
     private String fetchOne(String code, String username) {
+        String uri = "/api/rates/" + code;
+        long start = System.currentTimeMillis();
+        int status = 0;
+        String response;
         try {
             HttpHeaders headers = new HttpHeaders();
             headers.set("X-Client", "telegram-bot");
@@ -134,30 +187,35 @@ public class MyBot extends TelegramLongPollingBot {
             HttpEntity<Void> entity = new HttpEntity<>(headers);
 
             ResponseEntity<Map> resp = restTemplate.exchange(
-                    trackerUrl + "/api/rates/" + code,
-                    HttpMethod.GET,
-                    entity,
-                    Map.class);
+                    trackerUrl + uri, HttpMethod.GET, entity, Map.class);
 
+            status = resp.getStatusCode().value();
             Map body = resp.getBody();
             if (body == null || !"ok".equals(body.get("status"))) {
-                return "❌ Нет данных по " + code + ". Попробуй позже.";
+                response = "❌ Нет данных по " + code + ". Попробуй позже.";
+            } else {
+                String name = (String) body.get("name");
+                Double rate = ((Number) body.get("rate")).doubleValue();
+                String fetchedAt = (String) body.get("fetchedAt");
+                response = String.format("💱 %s (%s)%nКурс: %.4f ₽%nОбновлено: %s",
+                        name, code, rate, fetchedAt);
             }
-            String name = (String) body.get("name");
-            Double rate = ((Number) body.get("rate")).doubleValue();
-            String fetchedAt = (String) body.get("fetchedAt");
-
-            return String.format("""
-                    💱 %s (%s)
-                    Курс: %.4f ₽
-                    Обновлено: %s
-                    """, name, code, rate, fetchedAt);
+        } catch (HttpStatusCodeException e) {
+            status = e.getStatusCode().value();
+            response = "❌ HTTP " + status + ": " + e.getResponseBodyAsString();
         } catch (Exception e) {
-            return "❌ Ошибка: " + e.getMessage();
+            status = 0;
+            response = "❌ Ошибка: " + e.getMessage();
         }
+        recordOutgoing(uri, code, status, username, start);
+        return response;
     }
 
     private String fetchAll(String username) {
+        String uri = "/api/rates";
+        long start = System.currentTimeMillis();
+        int status = 0;
+        String response;
         try {
             HttpHeaders headers = new HttpHeaders();
             headers.set("X-Client", "telegram-bot");
@@ -165,25 +223,46 @@ public class MyBot extends TelegramLongPollingBot {
             HttpEntity<Void> entity = new HttpEntity<>(headers);
 
             ResponseEntity<Map> resp = restTemplate.exchange(
-                    trackerUrl + "/api/rates",
-                    HttpMethod.GET,
-                    entity,
-                    Map.class);
+                    trackerUrl + uri, HttpMethod.GET, entity, Map.class);
 
+            status = resp.getStatusCode().value();
             Map body = resp.getBody();
             if (body == null || body.isEmpty()) {
-                return "❌ Нет данных. Попробуй позже.";
+                response = "❌ Нет данных. Попробуй позже.";
+            } else {
+                StringBuilder sb = new StringBuilder("📊 Курсы валют (₽ за 1 ед.):\n\n");
+                for (Object key : body.keySet()) {
+                    sb.append(String.format("%s: %.4f%n", key, ((Number) body.get(key)).doubleValue()));
+                }
+                response = sb.toString();
             }
-            StringBuilder sb = new StringBuilder("📊 Курсы валют (₽ за 1 ед.):\n\n");
-            for (Object key : body.keySet()) {
-                Object val = body.get(key);
-                sb.append(String.format("%s: %.4f\n", key, ((Number) val).doubleValue()));
-            }
-            return sb.toString();
+        } catch (HttpStatusCodeException e) {
+            status = e.getStatusCode().value();
+            response = "❌ HTTP " + status + ": " + e.getResponseBodyAsString();
         } catch (Exception e) {
-            return "❌ Ошибка: " + e.getMessage();
+            status = 0;
+            response = "❌ Ошибка: " + e.getMessage();
         }
+        recordOutgoing(uri, "ALL", status, username, start);
+        return response;
     }
+
+    private void recordOutgoing(String uri, String code, int status, String username, long startMs) {
+        meterRegistry.counter("bot_gateway_requests_total",
+                "uri", uri,
+                "code", code,
+                "status", String.valueOf(status),
+                "user", username
+        ).increment();
+
+        meterRegistry.timer("bot_gateway_request_duration_seconds",
+                "uri", uri
+        ).record(System.currentTimeMillis() - startMs, TimeUnit.MILLISECONDS);
+    }
+
+    // ============================================================
+    // ВСПОМОГАТЕЛЬНЫЕ
+    // ============================================================
 
     private void editMessage(Long chatId, Integer msgId, String text, InlineKeyboardMarkup markup) {
         EditMessageText edit = new EditMessageText();
