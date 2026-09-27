@@ -1,6 +1,9 @@
 package com.example.bot;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
@@ -14,7 +17,9 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMa
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 
 @Component
 public class MyBot extends TelegramLongPollingBot {
@@ -57,18 +62,7 @@ public class MyBot extends TelegramLongPollingBot {
         SendMessage msg = new SendMessage();
         msg.setChatId(chatId.toString());
         msg.setText("💱 Выбери валюту:");
-
-        InlineKeyboardMarkup markup = new InlineKeyboardMarkup();
-        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
-
-        rows.add(List.of(btn("🇺🇸 Доллар США", "cur:USD"), btn("🇪🇺 Евро", "cur:EUR")));
-        rows.add(List.of(btn("🇰🇷 Вона", "cur:KRW"), btn("🇨🇳 Юань", "cur:CNY")));
-        rows.add(List.of(btn("🇯🇵 Йена", "cur:JPY")));
-        rows.add(List.of(btn("📊 Все курсы", "cur:ALL")));
-
-        markup.setKeyboard(rows);
-        msg.setReplyMarkup(markup);
-
+        msg.setReplyMarkup(buildMenu());
         try {
             execute(msg);
         } catch (TelegramApiException e) {
@@ -81,32 +75,6 @@ public class MyBot extends TelegramLongPollingBot {
         b.setText(text);
         b.setCallbackData(data);
         return b;
-    }
-
-    private void handleCallback(CallbackQuery cb) {
-        String data = cb.getData();
-        Long chatId = cb.getMessage().getChatId();
-        Integer msgId = cb.getMessage().getMessageId();
-
-        answerCallback(cb.getId());
-
-        if (data.equals("menu:refresh")) {
-            editMessage(chatId, msgId, "💱 Выбери валюту:", buildMenu());
-            return;
-        }
-
-        if (data.startsWith("cur:")) {
-            String code = data.substring(4);
-            String response;
-
-            if (code.equals("ALL")) {
-                response = fetchAll();
-            } else {
-                response = fetchOne(code);
-            }
-
-            editMessage(chatId, msgId, response, buildBackMenu());
-        }
     }
 
     private InlineKeyboardMarkup buildMenu() {
@@ -128,10 +96,49 @@ public class MyBot extends TelegramLongPollingBot {
         return markup;
     }
 
-    private String fetchOne(String code) {
+    private void handleCallback(CallbackQuery cb) {
+        String data = cb.getData();
+        Long chatId = cb.getMessage().getChatId();
+        Integer msgId = cb.getMessage().getMessageId();
+
+        String username = cb.getFrom() != null && cb.getFrom().getUserName() != null
+                ? cb.getFrom().getUserName()
+                : "unknown";
+
+        answerCallback(cb.getId());
+
+        if (data.equals("menu:refresh")) {
+            editMessage(chatId, msgId, "💱 Выбери валюту:", buildMenu());
+            return;
+        }
+
+        if (data.startsWith("cur:")) {
+            String code = data.substring(4);
+            String response;
+
+            if (code.equals("ALL")) {
+                response = fetchAll(username);
+            } else {
+                response = fetchOne(code, username);
+            }
+
+            editMessage(chatId, msgId, response, buildBackMenu());
+        }
+    }
+
+    private String fetchOne(String code, String username) {
         try {
-            ResponseEntity<Map> resp = restTemplate.getForEntity(
-                    trackerUrl + "/api/rates/" + code, Map.class);
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("X-Client", "telegram-bot");
+            headers.set("X-User", username);
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+
+            ResponseEntity<Map> resp = restTemplate.exchange(
+                    trackerUrl + "/api/rates/" + code,
+                    HttpMethod.GET,
+                    entity,
+                    Map.class);
+
             Map body = resp.getBody();
             if (body == null || !"ok".equals(body.get("status"))) {
                 return "❌ Нет данных по " + code + ". Попробуй позже.";
@@ -150,10 +157,19 @@ public class MyBot extends TelegramLongPollingBot {
         }
     }
 
-    private String fetchAll() {
+    private String fetchAll(String username) {
         try {
-            ResponseEntity<Map> resp = restTemplate.getForEntity(
-                    trackerUrl + "/api/rates", Map.class);
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("X-Client", "telegram-bot");
+            headers.set("X-User", username);
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+
+            ResponseEntity<Map> resp = restTemplate.exchange(
+                    trackerUrl + "/api/rates",
+                    HttpMethod.GET,
+                    entity,
+                    Map.class);
+
             Map body = resp.getBody();
             if (body == null || body.isEmpty()) {
                 return "❌ Нет данных. Попробуй позже.";
